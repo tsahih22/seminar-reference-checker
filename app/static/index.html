@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seminar Reference Checker</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --text:#1d1d1b; --muted:#6b6b66; --line:#e3e3de;
+          --ok:#1a7f4b; --okbg:#e3f4ea; --warn:#9a6700; --warnbg:#fff3d1;
+          --bad:#b42318; --badbg:#fde4e1; --err:#555; --errbg:#ececec; --accent:#2f5bd6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16171a; --card:#202226; --text:#ececec; --muted:#9a9a95; --line:#33353a;
+            --ok:#5fd493; --okbg:#173326; --warn:#f0c04d; --warnbg:#3a2f12;
+            --bad:#ff8a7d; --badbg:#3d1c19; --err:#bbb; --errbg:#2c2d30; --accent:#8aa7ff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 20px; }
+  .drop { background:var(--card); border:2px dashed var(--line); border-radius:12px; padding:28px; text-align:center; }
+  .drop.over { border-color: var(--accent); }
+  button, .btn { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  input[type=file] { display:none; }
+  #filename { margin: 10px 0; color: var(--muted); }
+  .summary { display:flex; flex-wrap:wrap; gap:10px; margin:24px 0 8px; }
+  .chip { border-radius:999px; padding:4px 14px; font-size:.9rem; border:1px solid transparent; cursor:pointer; }
+  .chip.active { outline:2px solid var(--accent); }
+  .b-found{background:var(--okbg);color:var(--ok)} .b-likely{background:var(--warnbg);color:var(--warn)}
+  .b-not_found{background:var(--badbg);color:var(--bad)} .b-error,.b-pending{background:var(--errbg);color:var(--err)}
+  .bar { height:6px; background:var(--line); border-radius:3px; overflow:hidden; margin:12px 0; }
+  .bar > div { height:100%; background:var(--accent); width:0; transition:width .2s; }
+  .ref { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:10px 0; }
+  .ref .top { display:flex; gap:10px; align-items:flex-start; justify-content:space-between; }
+  .ref .raw { flex:1; word-break:break-word; }
+  .badge { font-size:.8rem; padding:2px 10px; border-radius:999px; white-space:nowrap; }
+  .meta { color:var(--muted); font-size:.9rem; margin-top:6px; }
+  .meta a { color:var(--accent); }
+  .meta ul { margin:4px 0 0; padding-inline-start:20px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 16px; margin-top:16px; }
+  .panel h2 { font-size:1.05rem; margin:0 0 6px; }
+  .alert { background:var(--warnbg); color:var(--warn); padding:10px 14px; border-radius:8px; margin-top:16px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Seminar Reference Checker</h1>
+  <p class="sub">Upload a student paper (PDF or Word). Each reference is looked up in Crossref, OpenAlex and Semantic Scholar. Nothing is stored.</p>
+
+  <div class="drop" id="drop">
+    <label class="btn" for="file">Choose a paper</label>
+    <input type="file" id="file" accept=".pdf,.docx">
+    <div id="filename">or drop a .pdf / .docx file here</div>
+    <button id="go" disabled>Check references</button>
+  </div>
+
+  <div id="msg" class="alert" hidden></div>
+  <div id="progress" hidden><div class="bar"><div id="barfill"></div></div><div id="ptext" class="meta"></div></div>
+  <div class="summary" id="summary" hidden></div>
+  <div id="intext" class="panel" hidden></div>
+  <div id="list"></div>
+  <p class="meta" id="footnote" hidden>“Not found” does not mean fabricated. Books, theses, reports and Hebrew-language sources are often missing from these databases. Use the Google Scholar link to check by hand.</p>
+</main>
+<script>
+const LABEL = {found:"Found", likely:"Likely match", not_found:"Not found", error:"Lookup error", pending:"Checking…"};
+const $ = id => document.getElementById(id);
+let file = null, refs = [], results = {}, filter = "all";
+
+function setFile(f) { file = f; $("filename").textContent = f ? f.name : "or drop a .pdf / .docx file here"; $("go").disabled = !f; }
+$("file").onchange = e => setFile(e.target.files[0] || null);
+const drop = $("drop");
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); setFile(e.dataTransfer.files[0] || null); };
+
+function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+function showMsg(t) { $("msg").textContent = t; $("msg").hidden = !t; }
+
+function renderSummary() {
+  const counts = {found:0, likely:0, not_found:0, error:0, pending:0};
+  refs.forEach(r => counts[(results[r.index] || {status:"pending"}).status]++);
+  const chips = [["all", `All (${refs.length})`, ""]].concat(
+    ["not_found","likely","found","error","pending"].filter(k => counts[k])
+      .map(k => [k, `${LABEL[k]} (${counts[k]})`, "b-" + k]));
+  $("summary").innerHTML = chips.map(([k, t, c]) =>
+    `<span class="chip ${c} ${filter===k?"active":""}" data-k="${k}">${t}</span>`).join("");
+  $("summary").hidden = !refs.length;
+  $("summary").querySelectorAll(".chip").forEach(c => c.onclick = () => { filter = c.dataset.k; renderSummary(); renderList(); });
+  const done = refs.length - counts.pending;
+  $("barfill").style.width = refs.length ? (100 * done / refs.length) + "%" : "0";
+  $("ptext").textContent = `${done} of ${refs.length} references checked`;
+}
+
+function renderList() {
+  const order = {not_found:0, error:1, likely:2, found:3, pending:4};
+  const items = refs.map(r => ({r, res: results[r.index] || {status:"pending"}}))
+    .filter(x => filter === "all" || x.res.status === filter)
+    .sort((a, b) => order[a.res.status] - order[b.res.status] || a.r.index - b.r.index);
+  $("list").innerHTML = items.map(({r, res}) => {
+    const m = res.match;
+    const matchLine = m ? `<div class="meta">${res.match_is_closest_only ? "Closest database record" : "Matched"} (${esc(m.source)}${res.score ? ", " + res.score + "% title similarity" : ""}):
+      ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.title)}</a>` : esc(m.title)} ${m.year ? "(" + esc(m.year) + ")" : ""}</div>` : "";
+    const notes = (res.notes || []).length ? `<ul>${res.notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : "";
+    const scholar = res.scholar_url ? `<div class="meta"><a href="${esc(res.scholar_url)}" target="_blank" rel="noopener">Search on Google Scholar</a></div>` : "";
+    return `<div class="ref"><div class="top"><div class="raw" dir="auto"><strong>${r.index}.</strong> ${esc(r.raw)}</div>
+      <span class="badge b-${res.status}">${LABEL[res.status]}</span></div>${matchLine}<div class="meta">${notes}</div>${scholar}</div>`;
+  }).join("");
+}
+
+function renderIntext(info) {
+  const box = $("intext");
+  if (!info) { box.hidden = true; return; }
+  const missing = info.cited_not_in_bibliography, uncited = info.bibliography_not_cited;
+  let html = `<h2>In-text citations vs. bibliography</h2><div class="meta">${info.citations_found} in-text citations detected.</div>`;
+  html += missing.length
+    ? `<p><strong>Cited in the text but missing from the bibliography (${missing.length}):</strong></p><ul>${missing.map(m => `<li dir="auto">${esc(m.citation)} <span class="meta">— e.g. “${esc(m.example)}”</span></li>`).join("")}</ul>`
+    : `<p>Every in-text citation has a bibliography entry.</p>`;
+  html += uncited.length
+    ? `<p><strong>In the bibliography but not cited in the text (${uncited.length}):</strong> references ${uncited.join(", ")}</p>`
+    : `<p>Every bibliography entry is cited in the text.</p>`;
+  box.innerHTML = html + `<div class="meta">Detection is approximate, especially for Hebrew text and unusual citation formats.</div>`;
+  box.hidden = false;
+}
+
+$("go").onclick = async () => {
+  if (!file) return;
+  refs = []; results = {}; filter = "all";
+  $("list").innerHTML = ""; $("intext").hidden = true; $("summary").hidden = true; showMsg("");
+  $("progress").hidden = false; $("ptext").textContent = "Reading the paper…"; $("barfill").style.width = "0";
+  $("go").disabled = true;
+  try {
+    const fd = new FormData(); fd.append("file", file);
+    const resp = await fetch("/api/check", {method:"POST", body: fd});
+    if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).detail || resp.statusText);
+    const reader = resp.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        if (msg.type === "parsed") {
+          refs = msg.references;
+          if (!msg.bibliography_found) showMsg("No bibliography heading (References / Bibliography / רשימת מקורות) was found in this file.");
+          else if (!refs.length) showMsg("A bibliography heading was found, but no entries could be read from it.");
+          renderIntext(msg.intext);
+          $("footnote").hidden = false;
+        } else if (msg.type === "result") { results[msg.index] = msg; }
+        renderSummary(); renderList();
+      }
+    }
+  } catch (e) { showMsg("Something went wrong: " + e.message); $("progress").hidden = true; }
+  $("go").disabled = false;
+};
+</script>
+</body>
+</html>
